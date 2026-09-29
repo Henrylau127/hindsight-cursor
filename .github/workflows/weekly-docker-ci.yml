@@ -1,0 +1,209 @@
+# Weekly CI: rebuild hindsight-cursor when ghcr.io/vectorize-io/hindsight:latest
+# or the Cursor agent build embedded in https://cursor.com/install has changed.
+# Same shape as n8n-exif: resolve versions, compare with the last build recorded
+# in the Actions cache, and skip the image build when both are unchanged.
+#
+# Schedule: Saturday 06:00 GMT+8 (Friday 22:00 UTC).
+# Manual run: Actions tab -> Weekly Docker CI -> Run workflow.
+#
+# Upstream tag is ghcr.io/vectorize-io/hindsight:latest, the full image.
+# That build includes the local embedding model (BAAI/bge-small-en-v1.5) and
+# reranker (cross-encoder/ms-marco-MiniLM-L-6-v2). Slim tags are rejected.
+# The full amd64 image is about 9 GB. GitHub-hosted runners only guarantee
+# 14 GB free, so the build step frees preinstalled toolchains first.
+#
+# Publishes the image with GITHUB_TOKEN. New GHCR packages are private, and
+# package visibility is a settings change, not a packages:write API call, so
+# this workflow only reads visibility. Set the package to public once under
+# Packages -> Package settings -> Change visibility. The build is recorded
+# after a successful push so an unchanged version is not rebuilt. No Docker
+# Hub secret is required: the base image is public on GHCR.
+
+name: Weekly Docker CI
+
+on:
+  schedule:
+    - cron: "0 22 * * 5"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even if Hindsight and Cursor agent versions are unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: weekly-docker-ci
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      LOCAL_IMAGE: hindsight-cursor:verify
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      # Full image. latest-slim omits the local embedding and reranker models.
+      HINDSIGHT_TAG: latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore last built version
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci
+          # Cache entries cannot be overwritten. A unique primary key misses,
+          # and restore-keys loads the newest hindsight-cursor-last-built-* entry.
+          key: hindsight-cursor-last-built-miss-${{ github.run_id }}
+          restore-keys: |
+            hindsight-cursor-last-built-
+
+      - name: Check Hindsight and Cursor agent versions
+        id: version-check
+        env:
+          FORCE_BUILD: ${{ inputs.force_build == true && 'true' || 'false' }}
+          BUILD_ARG_FILE: ${{ runner.temp }}/build-args
+          RESOLVE_PLATFORM: linux/amd64
+          HINDSIGHT_TAG: ${{ env.HINDSIGHT_TAG }}
+        run: bash ./scripts/check-build-version.sh
+
+      - name: Free disk space
+        if: steps.version-check.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift
+          sudo apt-get clean
+          docker builder prune -af || true
+          df -h /
+
+      - name: Build and verify (linux/amd64)
+        if: steps.version-check.outputs.build_needed == 'true'
+        env:
+          BUILD_ARG_FILE: ${{ steps.version-check.outputs.build_arg_file }}
+          IMAGE: ${{ env.LOCAL_IMAGE }}
+          PLATFORM: linux/amd64
+        run: bash ./scripts/verify.sh
+
+      - name: Log in to GHCR
+        if: steps.version-check.outputs.build_needed == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        if: steps.version-check.outputs.build_needed == 'true'
+        id: publish
+        run: |
+          set -euo pipefail
+          IMAGE_ID="$(echo "${GHCR_IMAGE}" | tr '[:upper:]' '[:lower:]')"
+          VERSION="${{ steps.version-check.outputs.image_tag }}"
+
+          docker tag "${LOCAL_IMAGE}" "${IMAGE_ID}:latest"
+          docker tag "${LOCAL_IMAGE}" "${IMAGE_ID}:${VERSION}"
+
+          docker push "${IMAGE_ID}:latest"
+          docker push "${IMAGE_ID}:${VERSION}"
+
+          echo "ghcr_image=${IMAGE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "ghcr_tags=latest,${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Read GHCR package visibility
+        id: visibility
+        if: steps.publish.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          PACKAGE_NAME="$(printf '%s' "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')"
+          owner_type="$(gh api "users/${OWNER}" --jq .type)"
+          if [ "${owner_type}" = "Organization" ]; then
+            api_path="orgs/${OWNER}/packages/container/${PACKAGE_NAME}"
+          else
+            api_path="users/${OWNER}/packages/container/${PACKAGE_NAME}"
+          fi
+
+          visibility=""
+          for attempt in 1 2 3 4 5 6; do
+            visibility="$(gh api "${api_path}" --jq .visibility 2>/dev/null || true)"
+            if [ -n "${visibility}" ]; then
+              break
+            fi
+            echo "Package not visible in the API yet (attempt ${attempt})"
+            sleep 5
+          done
+
+          if [ "${visibility}" = "public" ]; then
+            echo "GHCR package is public"
+            echo "package_public=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "GHCR package visibility is '${visibility:-unknown}'."
+          echo "GITHUB_TOKEN cannot change package visibility. Set it once: Packages -> ${PACKAGE_NAME} -> Package settings -> Change visibility -> Public."
+          echo "package_public=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Record last built version
+        if: steps.publish.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p .ci
+          {
+            printf 'HINDSIGHT_VERSION=%s\n' "${{ steps.version-check.outputs.hindsight_version }}"
+            printf 'CURSOR_AGENT_VERSION=%s\n' "${{ steps.version-check.outputs.cursor_agent_version }}"
+            printf 'UPSTREAM=%s:%s\n' "${{ steps.version-check.outputs.hindsight_registry_image }}" "${{ steps.version-check.outputs.hindsight_tag }}"
+            printf 'IMAGE_TAG=%s\n' "${{ steps.version-check.outputs.image_tag }}"
+            printf 'BUILT_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > .ci/last-built-version
+
+      - name: Save last built version
+        if: steps.publish.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci
+          key: hindsight-cursor-last-built-${{ steps.version-check.outputs.image_tag }}-${{ github.run_id }}
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Weekly Docker CI"
+            echo ""
+            echo "- **Trigger:** ${{ github.event_name }}"
+            echo "- **Platform:** linux/amd64"
+            echo "- **Resolved Hindsight:** ${{ steps.version-check.outputs.hindsight_registry_image }}:${{ steps.version-check.outputs.hindsight_tag }} (${{ steps.version-check.outputs.hindsight_version }})"
+            echo "- **Resolved Cursor agent:** ${{ steps.version-check.outputs.cursor_agent_version }}"
+            echo "- **Last built Hindsight:** ${{ steps.version-check.outputs.last_hindsight_version || 'none' }}"
+            echo "- **Last built Cursor agent:** ${{ steps.version-check.outputs.last_cursor_agent_version || 'none' }}"
+            if [ "${{ steps.publish.outcome }}" = "success" ] && [ "${{ steps.visibility.outputs.package_public }}" = "true" ]; then
+              echo "- **Result:** built, verified, and published as a public package (${{ steps.version-check.outputs.skip_reason }})"
+              echo "- **Pull (no login):** \`${{ steps.publish.outputs.ghcr_image }}:latest\`"
+              echo "- **Rollback tag:** \`${{ steps.publish.outputs.ghcr_image }}:${{ steps.version-check.outputs.image_tag }}\`"
+              echo ""
+              echo '```yaml'
+              echo "image: ${{ steps.publish.outputs.ghcr_image }}:latest"
+              echo '```'
+            elif [ "${{ steps.publish.outcome }}" = "success" ]; then
+              echo "- **Result:** image pushed; package is not public (${{ steps.version-check.outputs.skip_reason }})"
+              echo "- **Visibility:** set once under Packages -> Package settings -> Change visibility -> Public"
+              echo "- **Image:** \`${{ steps.publish.outputs.ghcr_image }}:latest\`"
+            elif [ "${{ steps.version-check.outputs.build_needed }}" = "true" ]; then
+              echo "- **Result:** build did not publish (${{ steps.version-check.outputs.skip_reason }})"
+            else
+              echo "- **Result:** skipped (${{ steps.version-check.outputs.skip_reason }})"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
