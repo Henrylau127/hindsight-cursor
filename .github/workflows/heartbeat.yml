@@ -1,0 +1,36 @@
+name: Weekly Heartbeat
+
+on:
+  schedule:
+    - cron: "30 22 * * 5"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-heartbeat
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update heartbeat timestamp
+        run: |
+          mkdir -p .github/automation
+          printf 'Last successful heartbeat: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .github/automation/last-successful-run.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+Henrylau127@users.noreply.github.com"
+          git add .github/automation/last-successful-run.txt
+          git diff --cached --quiet || git commit -m "chore: record weekly heartbeat [skip ci]"
+          git push origin HEAD:main
