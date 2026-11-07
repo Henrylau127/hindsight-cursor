@@ -25,15 +25,23 @@ ARG RESOLVED_BY_SCRIPT
 ARG CURSOR_AGENT_VERSION=unknown
 ARG TARGETARCH
 
+# Named accounts come from the base image; their numeric ids are not a contract.
+# hadolint ignore=DL3066
 USER root
 
+# Apt package versions follow the base image's Debian suite, which changes with
+# the resolved Hindsight tag.
+# hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates bash \
     && rm -rf /var/lib/apt/lists/*
 
+# hadolint ignore=DL3066
 USER hindsight
 ENV PATH="/home/hindsight/.local/bin:${PATH}"
 
+# Fail the following RUN when curl fails. Bash is installed above.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN if [ "${RESOLVED_BY_SCRIPT}" != "true" ]; then \
       echo "Build via scripts/resolve-build-versions.sh (see Dockerfile header)." >&2; \
       exit 1; \
