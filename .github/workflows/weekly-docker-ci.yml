@@ -7,8 +7,9 @@
 # Manual run: Actions tab -> Weekly Docker CI -> Run workflow.
 #
 # Upstream tag is ghcr.io/vectorize-io/hindsight:latest, the full image.
-# That build includes the local embedding model (BAAI/bge-small-en-v1.5) and
-# reranker (cross-encoder/ms-marco-MiniLM-L-6-v2). Slim tags are rejected.
+# That build preloads the default local embedding and reranker. Verify reads
+# those model ids from hindsight_api.config in the image and requires their
+# Hugging Face weight files. Slim tags are rejected.
 # The full amd64 image is about 9 GB. GitHub-hosted runners only guarantee
 # 14 GB free, so the build step frees preinstalled toolchains first.
 #

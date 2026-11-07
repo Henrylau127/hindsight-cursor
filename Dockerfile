@@ -4,7 +4,7 @@
 # scripts/resolve-build-versions.sh. That script reads the full
 # ghcr.io/vectorize-io/hindsight:latest tag (OCI label, no layer download),
 # never a -slim tag, and the version embedded in https://cursor.com/install.
-# The full image carries the local embedding and reranker models.
+# The full image carries the default local embedding and reranker models.
 # Do not build without it:
 #
 #   ./scripts/verify-local.sh

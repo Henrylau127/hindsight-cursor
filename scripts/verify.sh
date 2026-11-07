@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Resolve versions, build linux/amd64, and check cursor-agent is the pinned build.
+# Resolve versions, build linux/amd64, and check the pinned cursor-agent plus
+# the full image's default local embedding and reranker weights.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,11 +44,18 @@ docker build \
   "${ROOT_DIR}"
 
 echo "==> Verify cursor-agent version and full-image models"
-docker run --rm --platform "${PLATFORM}" --entrypoint bash "${IMAGE}" -c "
-  set -eu
-  cursor-agent --version | grep -F '${CURSOR_AGENT_VERSION}'
-  test -d /home/hindsight/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5
-  test -d /home/hindsight/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2
-"
+docker run --rm --platform "${PLATFORM}" \
+  --entrypoint bash \
+  -e CURSOR_AGENT_VERSION="${CURSOR_AGENT_VERSION}" \
+  -v "${SCRIPT_DIR}/check-baked-models.py:/tmp/check-baked-models.py:ro" \
+  "${IMAGE}" -c '
+  set -euo pipefail
+  cursor-agent --version | grep -F "${CURSOR_AGENT_VERSION}"
+  python_bin=/app/api/.venv/bin/python
+  if [ ! -x "${python_bin}" ]; then
+    python_bin=$(command -v python3)
+  fi
+  "${python_bin}" /tmp/check-baked-models.py
+'
 
 echo "Checks passed (hindsight ${HINDSIGHT_VERSION}, cursor-agent ${CURSOR_AGENT_VERSION}, local embedding and reranker present)."
